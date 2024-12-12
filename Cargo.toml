@@ -28,6 +28,7 @@ ordinals = { git = "https://github.com/kungfuflex/alkanes-rs" }
 anyhow = "1.0.94"
 bitcoin = { version = "0.32.4", features = ["rand"] }
 hex = "0.4.3"
+bitcoin_hashes = "0.14.0"
 
 [dev-dependencies]
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", features = ["test-utils"] }

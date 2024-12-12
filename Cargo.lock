@@ -721,6 +721,7 @@ dependencies = [
  "alkanes-support",
  "anyhow",
  "bitcoin 0.32.5",
+ "bitcoin_hashes 0.14.0",
  "flate2",
  "frbtc-support",
  "hex",

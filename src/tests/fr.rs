@@ -3,7 +3,9 @@ use alkanes_support::id::AlkaneId;
 use anyhow::{anyhow, Result};
 use bitcoin::blockdata::transaction::OutPoint;
 use bitcoin::address::{NetworkChecked};
-use bitcoin::{Witness, Sequence,  Amount, ScriptBuf, Script, Address, TxIn, TxOut, Transaction};
+use bitcoin::{Witness, Sequence,  Amount, ScriptBuf, Script, Address, TxIn, TxOut, Transaction, script::{self, Builder, PushBytes}, absolute::LockTime, transaction::Version, Txid, opcodes::all as opcodes};
+use bitcoin_hashes::{Hash, sha256d};
+
 use protorune_support::protostone::Protostone;
 use protorune::protostone::Protostones;
 #[allow(unused_imports)]
@@ -16,7 +18,7 @@ use protorune::{test_helpers::{get_address}, balance_sheet::load_sheet, message:
 use protorune_support::utils::consensus_encode;
 
 use alkanes::indexer::index_block;
-use ordinals::{Runestone, Artifact};
+use ordinals::{Runestone, Artifact, runestone::tag::Tag};
 use alkanes::tests::helpers as alkane_helpers;
 use alkanes::precompiled::{alkanes_std_auth_token_build};
 use alkanes_support::{cellpack::Cellpack, constants::AUTH_TOKEN_FACTORY_ID};
@@ -306,6 +308,86 @@ fn test_protostone_encoding() -> Result<()> {
         },
         Artifact::Cenotaph(_) => {
             Err(anyhow!("Expected Runestone but got Cenotaph"))
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn test_block_construction_and_deployment() -> Result<()> {
+    println!("Starting runestone construction...");
+    
+    let mut script_builder = Builder::new();
+    
+    // Add OP_RETURN and magic number
+    script_builder = script_builder
+        .push_opcode(opcodes::OP_RETURN)
+        .push_opcode(Runestone::MAGIC_NUMBER);
+    
+    // Create tag data
+    let mut tag_data = Vec::new();
+    
+    // Add pointer tag (pointing to output index 1)
+    Tag::Pointer.encode([1], &mut tag_data);
+    println!("Added pointer to output 1");
+    
+    // Convert tag data to PushBytes and add to script
+    let push_bytes: &PushBytes = tag_data.as_slice().try_into()
+        .map_err(|_| anyhow!("Failed to convert tag data to push bytes"))?;
+    
+    script_builder = script_builder.push_slice(push_bytes);
+    
+    // Build the final script
+    let script_pubkey = script_builder.into_script();
+    println!("Created script_pubkey: {:?}", script_pubkey);
+
+    // Create transaction with:
+    // - Output 0: Regular output (spendable by synthetic)
+    // - Output 1: Target output (pointed to by runestone)
+    // - Output 2: OP_RETURN with runestone
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_raw_hash(sha256d::Hash::hash(&[0; 32])),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            // Output 0: Regular output
+            TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            // Output 1: Target output (pointed to by runestone)
+            TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            // Output 2: OP_RETURN with runestone
+            TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey,
+            }
+        ],
+    };
+
+    println!("Created transaction: {:?}", tx);
+
+    // Try to decipher and print the result or detailed error
+    match Runestone::decipher(&tx) {
+        Some(Artifact::Runestone(runestone)) => {
+            println!("Successfully deciphered runestone: {:?}", runestone);
+            Ok(())
+        },
+        Some(Artifact::Cenotaph(cenotaph)) => {
+            Err(anyhow!("Got cenotaph (invalid runestone): {:?}", cenotaph))
+        },
+        None => {
+            Err(anyhow!("Failed to decipher runestone - no valid runestone found in transaction"))
         }
     }
 }
