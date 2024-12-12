@@ -1,6 +1,6 @@
 use alkanes::message::AlkaneMessageContext;
 use alkanes_support::id::AlkaneId;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bitcoin::blockdata::transaction::OutPoint;
 use bitcoin::address::{NetworkChecked};
 use bitcoin::{Witness, Sequence,  Amount, ScriptBuf, Script, Address, TxIn, TxOut, Transaction};
@@ -263,4 +263,49 @@ fn test_synthetic_init() -> Result<()> {
       tx: 0
     }).into()).keyword("/storage/").keyword("/payments/byheight/").select_value::<u64>(block_height.into()).get().as_ref().clone()));
     Ok(())
+}
+#[wasm_bindgen_test]
+fn test_burn_basic() -> Result<()> {
+    let inputs = vec![OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000000".parse().unwrap(),
+        vout: 0
+    }];
+    let tx = burn(inputs);
+    
+    assert_eq!(tx.output.len(), 3);
+    assert_eq!(tx.output[0].value.to_sat(), 546);
+    assert_eq!(tx.output[1].value.to_sat(), 546);
+    assert_eq!(tx.output[2].value.to_sat(), 0); // OP_RETURN
+    
+    // Verify addresses
+    assert_eq!(tx.output[0].script_pubkey, get_address(ADDRESS1).script_pubkey());
+    assert_eq!(tx.output[1].script_pubkey, get_address(TEST_MULTISIG).script_pubkey());
+    
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+fn test_protostone_encoding() -> Result<()> {
+    let inputs = vec![OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000000".parse().unwrap(),
+        vout: 0
+    }];
+    
+    let tx = pay_to_musig(inputs, 1_000_000);
+    
+    // Verify the OP_RETURN output contains a valid Protostone
+    let artifact = Runestone::decipher(&tx)
+        .ok_or_else(|| anyhow!("Failed to decipher runestone"))?;
+    
+    match artifact {
+        Artifact::Runestone(runestone) => {
+            assert!(runestone.protocol.is_some());
+            assert_eq!(runestone.pointer, Some(0));
+            assert!(runestone.edicts.is_empty());
+            Ok(())
+        },
+        Artifact::Cenotaph(_) => {
+            Err(anyhow!("Expected Runestone but got Cenotaph"))
+        }
+    }
 }
