@@ -1,284 +1,255 @@
-use alkanes_runtime::{auth::AuthenticatedResponder, token::Token};
-#[allow(unused_imports)]
-use alkanes_runtime::{
-    println,
-    stdio::{stdout, Write},
-};
+use alkanes::message::AlkaneMessageContext;
+use alkanes_support::id::AlkaneId;
 use anyhow::{anyhow, Result};
-use alkanes_runtime::{runtime::AlkaneResponder, storage::StoragePointer};
-use alkanes_support::{id::AlkaneId, utils::{shift_or_err}};
-use alkanes_support::{context::Context, parcel::AlkaneTransfer, response::CallResponse};
-use metashrew_support::{utils::{consensus_decode}, compat::{to_arraybuffer_layout, to_passback_ptr}};
-use metashrew_support::index_pointer::KeyValuePointer;
-use protorune_support::{network::{to_address_str, NetworkParams, set_network},protostone::{Protostone}};
-use ordinals::{Runestone, Artifact};
-use bitcoin::{Script, OutPoint, Amount, TxOut, Transaction};
-use bitcoin::hashes::{Hash};
-use frbtc_support::{Payment};
+use bitcoin_hashes::{sha256, Hash};
 use std::sync::Arc;
+use alkanes_runtime::{runtime::AlkaneResponder, storage::StoragePointer};
+use alkanes_support::context::Context;
+use alkanes_support::parcel::{AlkaneTransfer, AlkaneTransferParcel};
+use alkanes_support::response::CallResponse;
+use alkanes_support::utils::shift_or_err;
 
 #[derive(Default)]
-pub struct SyntheticBitcoin(());
+pub struct EIP918Token(());
 
-#[cfg(all(
-    not(feature = "mainnet"),
-    not(feature = "testnet"),
-    not(feature = "luckycoin"),
-    not(feature = "dogecoin"),
-    not(feature = "bellscoin")
-))]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("bcrt"),
-        p2pkh_prefix: 0x64,
-        p2sh_prefix: 0xc4,
-    });
-}
-#[cfg(feature = "mainnet")]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("bc"),
-        p2sh_prefix: 0x05,
-        p2pkh_prefix: 0x00,
-    });
-}
-#[cfg(feature = "testnet")]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("tb"),
-        p2pkh_prefix: 0x6f,
-        p2sh_prefix: 0xc4,
-    });
-}
-#[cfg(feature = "luckycoin")]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("lky"),
-        p2pkh_hash: 0x2f,
-        p2sh_hash: 0x05,
-    });
-}
+impl EIP918Token {
+    // Constants matching the Solidity implementation
+    const BASE_MINING_REWARD: u64 = 50;
+    const BLOCKS_PER_READJUSTMENT: u64 = 1024;
+    const MINIMUM_TARGET: u128 = 2u128.pow(16);
+    const MAXIMUM_TARGET: u128 = 2u128.pow(234);
+    const MAX_REWARD_ERA: u64 = 39;
+    const MINING_RATE_FACTOR: u64 = 60;
+    const MAX_ADJUSTMENT_PERCENT: u64 = 100;
+    const TARGET_DIVISOR: u64 = 2000;
+    const QUOTIENT_LIMIT: u64 = TARGET_DIVISOR / 2;
 
-#[cfg(feature = "dogecoin")]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("dc"),
-        p2pkh_hash: 0x1e,
-        p2sh_hash: 0x16,
-    });
-}
-#[cfg(feature = "bellscoin")]
-pub fn configure_network() {
-    set_network(NetworkParams {
-        bech32_prefix: String::from("bel"),
-        p2pkh_hash: 0x19,
-        p2sh_hash: 0x1e,
-    });
-}
+    // Storage pointers
+    fn initialized_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/initialized")
+    }
 
-pub trait MintableToken: Token {
-    fn mint(&self, context: &Context, value: u128) -> AlkaneTransfer {
-        AlkaneTransfer {
-            id: context.myself.clone(),
-            value,
+    fn challenge_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/challenge")
+    }
+    
+    fn solution_pointer(&self, challenge: &[u8; 32]) -> StoragePointer {
+        StoragePointer::from_keyword("/solutions/").append(&challenge.to_vec())
+    }
+    
+    fn mining_target_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/mining_target")
+    }
+    
+    fn tokens_minted_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/tokens_minted")
+    }
+    
+    fn epoch_count_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/epoch_count") 
+    }
+    
+    fn era_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/era")
+    }
+    
+    fn max_supply_era_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/max_supply_era")
+    }
+    
+    fn total_supply_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/total_supply")
+    }
+
+    fn last_difficulty_period_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/last_difficulty_period")
+    }
+
+    // Core mining functions
+    fn calculate_mining_hash(&self, nonce: u64, challenge_number: &[u8; 32]) -> Result<[u8; 32]> {
+        let mut engine = sha256::HashEngine::default();
+        engine.input(challenge_number);
+        engine.input(&self.context()?.sender.to_vec());
+        engine.input(&nonce.to_le_bytes());
+        Ok(sha256::Hash::from_engine(engine).into_inner())
+    }
+
+    fn verify_mining_solution(&self, context: &Context, nonce: u64) -> Result<()> {
+        let challenge_number = self.challenge_pointer().get_value::<[u8; 32]>()?;
+        let mining_target = self.mining_target_pointer().get_value::<u128>()?;
+        
+        // Calculate hash
+        let digest = self.calculate_mining_hash(nonce, &challenge_number)?;
+        
+        // Check solution hasn't been used
+        let solution_pointer = self.solution_pointer(&challenge_number);
+        if !solution_pointer.get().is_empty() {
+            return Err(anyhow!("solution already exists"));
         }
-    }
-}
-
-impl Token for SyntheticBitcoin {
-    fn name(&self) -> String {
-        String::from("SUBFROST BTC")
-    }
-    fn symbol(&self) -> String {
-        String::from("frBTC")
-    }
-}
-impl MintableToken for SyntheticBitcoin {}
-
-impl AuthenticatedResponder for SyntheticBitcoin {}
-
-impl SyntheticBitcoin {
-  fn signer_pointer(&self) -> StoragePointer {
-    StoragePointer::from_keyword("/signer")
-  }
-  fn signer(&self) -> Vec<u8> {
-    self.signer_pointer().get().as_ref().clone()
-  }
-  fn set_signer(&self, context: &Context, _vout: u32) -> Result<()> {
-    let vout = _vout as usize;
-    let tx = consensus_decode::<Transaction>(&mut std::io::Cursor::new(self.transaction()))?;
-    if let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(&tx) {
-      let protostones = Protostone::from_runestone(runestone)?;
-      let message = &protostones[(context.vout as usize) - tx.output.len() - 1];
-      if message.edicts.len() != 0 {
-        return Err(anyhow!("message cannot contain edicts, only a pointer"));
-      }
-      let pointer = message
-        .pointer
-        .ok_or("")
-        .map_err(|_| anyhow!("no pointer in message"))?;
-      if pointer as usize >= tx.output.len() {
-        return Err(anyhow!("pointer cannot be a protomessage"));
-      }
-      if pointer as usize == vout {
-        return Err(anyhow!("pointer cannot be equal to output spendable by synthetic"));
-      }
-      self.signer_pointer().set(Arc::new(tx.output[vout as usize].script_pubkey.as_bytes().to_vec()));
-      Ok(())
-    } else {
-      Err(anyhow!("unexpected condition: execution occurred with no Protostone present"))
-    }
-  }
-  fn observe_transaction(&self, tx: &Transaction) -> Result<()> {
-    let mut ptr = StoragePointer::from_keyword("/seen/").select(&tx.compute_txid().as_byte_array().to_vec());
-    if ptr.get().len() != 0 { 
-      Err(anyhow!("transaction already processed"))
-    } else {
-      ptr.set_value::<u8>(0x01);
-      Ok(())
-    }
-  }
-  fn compute_output(&self, tx: &Transaction) -> u128 {
-    let signer = self.signer();
-    tx.output.iter().fold(0, |r: u128, v: &TxOut| -> u128 {
-      if v.script_pubkey.as_bytes().to_vec() == signer {
-        r + <u64 as Into<u128>>::into(v.value.to_sat())
-      } else {
-        r
-      }
-    })
-  }
-  fn burn_input(&self, context: &Context) -> Result<u64> {
-    Ok(context.incoming_alkanes.0.iter().find(|v| context.myself == v.id).ok_or("").map_err(|_| anyhow!("must spend synthetics into message"))?.value.try_into()?)
-  }
-  fn burn(&self, context: &Context, vout: usize) -> Result<u64> {
-    let tx = consensus_decode::<Transaction>(&mut std::io::Cursor::new(self.transaction()))?;
-
-    if let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(&tx) {
-      let protostones = Protostone::from_runestone(runestone)?;
-      let message = &protostones[(context.vout as usize) - tx.output.len() - 1];
-      if message.edicts.len() != 0 {
-        return Err(anyhow!("message cannot contain edicts, only a pointer"));
-      }
-      let pointer = message
-        .pointer
-        .ok_or("")
-        .map_err(|_| anyhow!("no pointer in message"))?;
-      if pointer as usize >= tx.output.len() {
-        return Err(anyhow!("pointer cannot be a protomessage"));
-      }
-      if pointer as usize == vout {
-        return Err(anyhow!("pointer cannot be equal to output spendable by synthetic"));
-      }
-      let signer = self.signer();
-      if signer != tx.output[vout].script_pubkey.as_bytes().to_vec() {
-        return Err(anyhow!("signer pubkey must be targeted with supplementary output"));
-      }
-      let txid = tx.compute_txid();
-      let value = self.burn_input(context)?;
-      StoragePointer::from_keyword("/payments/byheight/").select_value(self.height()).append(Arc::<Vec<u8>>::new((Payment {
-        output: TxOut {
-          script_pubkey: tx.output[pointer as usize].script_pubkey.clone(),
-          value: Amount::from_sat(value)
-        },
-        spendable: OutPoint {
-          txid,
-          vout: vout.try_into()?
+        
+        // Verify hash meets difficulty target
+        let hash_value = u128::from_be_bytes(digest[0..16].try_into()?);
+        if hash_value > mining_target {
+            return Err(anyhow!("hash doesn't meet difficulty target"));
         }
-      }).serialize()?));
-      Ok(value)
-    } else {
-      Err(anyhow!("execution triggered unexpectedly -- no protostone"))
+
+        // Store solution
+        solution_pointer.set(Arc::new(digest.to_vec()));
+        Ok(())
     }
-  }
-  fn exchange(&self, context: &Context) -> Result<AlkaneTransfer> {
-    let tx = consensus_decode::<Transaction>(&mut std::io::Cursor::new(self.transaction()))?;
-    self.observe_transaction(&tx)?;
-    let payout = self.compute_output(&tx);
-    Ok(self.mint(&context, payout))
-  }
+
+    fn adjust_difficulty(&self) -> Result<()> {
+        let current_block = self.context()?.block_height;
+        let last_period = self.last_difficulty_period_pointer().get_value::<u64>()?;
+        let mining_target = self.mining_target_pointer().get_value::<u128>()?;
+        
+        let blocks_since_last = current_block.saturating_sub(last_period);
+        let target_blocks = self.BLOCKS_PER_READJUSTMENT * self.MINING_RATE_FACTOR;
+
+        let new_target = if blocks_since_last < target_blocks {
+            // Make it harder
+            let excess_block_pct = (target_blocks * self.MAX_ADJUSTMENT_PERCENT) / blocks_since_last;
+            let excess = (excess_block_pct.saturating_sub(100)).min(self.QUOTIENT_LIMIT);
+            mining_target.saturating_sub(mining_target / self.TARGET_DIVISOR * excess as u128)
+        } else {
+            // Make it easier
+            let shortage_block_pct = (blocks_since_last * self.MAX_ADJUSTMENT_PERCENT) / target_blocks;
+            let shortage = (shortage_block_pct.saturating_sub(100)).min(self.QUOTIENT_LIMIT);
+            mining_target.saturating_add(mining_target / self.TARGET_DIVISOR * shortage as u128)
+        };
+
+        // Clamp to bounds
+        let final_target = new_target.clamp(self.MINIMUM_TARGET, self.MAXIMUM_TARGET);
+        
+        // Store new values
+        self.mining_target_pointer().set(Arc::new(final_target.to_le_bytes().to_vec()));
+        self.last_difficulty_period_pointer().set(Arc::new(current_block.to_le_bytes().to_vec()));
+        
+        Ok(())
+    }
+
+    fn start_new_mining_epoch(&self) -> Result<()> {
+        let tokens_minted = self.tokens_minted_pointer().get_value::<u128>()?;
+        let reward = self.get_mining_reward()?;
+        let era = self.era_pointer().get_value::<u64>()?;
+        let max_supply_era = self.max_supply_era_pointer().get_value::<u128>()?;
+        
+        // Check if we need to enter new era
+        if tokens_minted.saturating_add(reward) > max_supply_era && era < self.MAX_REWARD_ERA {
+            self.era_pointer().set(Arc::new((era + 1).to_le_bytes().to_vec()));
+            
+            // Update max supply for new era
+            let total_supply = self.total_supply_pointer().get_value::<u128>()?;
+            let new_max = total_supply - total_supply / (2u128.pow((era + 1) as u32));
+            self.max_supply_era_pointer().set(Arc::new(new_max.to_le_bytes().to_vec()));
+        }
+
+        // Update epoch count
+        let epoch_count = self.epoch_count_pointer().get_value::<u64>()?;
+        self.epoch_count_pointer().set(Arc::new((epoch_count + 1).to_le_bytes().to_vec()));
+
+        // Adjust difficulty if needed
+        if epoch_count % self.BLOCKS_PER_READJUSTMENT == 0 {
+            self.adjust_difficulty()?;
+        }
+
+        // Update challenge number
+        let context = self.context()?;
+        let new_challenge = context.previous_block_hash;
+        self.challenge_pointer().set(Arc::new(new_challenge.to_vec()));
+
+        Ok(())
+    }
+
+    fn get_mining_reward(&self) -> Result<u128> {
+        let era = self.era_pointer().get_value::<u64>()?;
+        let base_reward = self.BASE_MINING_REWARD as u128 * 10u128.pow(8); // 8 decimals
+        Ok(base_reward / 2u128.pow(era as u32))
+    }
+
+    fn initialize(&self, context: &Context) -> Result<()> {
+        let mut initialized = self.initialized_pointer().get();
+        if !initialized.is_empty() {
+            return Err(anyhow!("already initialized"));
+        }
+
+        // Set initial values
+        self.total_supply_pointer().set(Arc::new((21_000_000u128 * 10u128.pow(8)).to_le_bytes().to_vec()));
+        self.mining_target_pointer().set(Arc::new(self.MAXIMUM_TARGET.to_le_bytes().to_vec()));
+        self.era_pointer().set(Arc::new(0u64.to_le_bytes().to_vec()));
+        self.epoch_count_pointer().set(Arc::new(0u64.to_le_bytes().to_vec()));
+        
+        // Set max supply for first era
+        let total_supply = self.total_supply_pointer().get_value::<u128>()?;
+        self.max_supply_era_pointer().set(Arc::new((total_supply / 2).to_le_bytes().to_vec()));
+        
+        // Set initial challenge
+        self.challenge_pointer().set(Arc::new(context.previous_block_hash.to_vec()));
+        
+        // Mark as initialized
+        initialized.set(Arc::new(vec![1]));
+        
+        Ok(())
+    }
+
+    fn mint_tokens(&self, context: &Context, amount: u128) -> Result<()> {
+        let tokens_minted = self.tokens_minted_pointer().get_value::<u128>()?;
+        self.tokens_minted_pointer().set(Arc::new((tokens_minted + amount).to_le_bytes().to_vec()));
+        Ok(())
+    }
+
+    fn context(&self) -> Result<Context> {
+        Context::current().ok_or_else(|| anyhow!("no context available"))
+    }
 }
 
-impl AlkaneResponder for SyntheticBitcoin {
+impl AlkaneResponder for EIP918Token {
     fn execute(&self) -> Result<CallResponse> {
-        configure_network();
         let context = self.context()?;
         let mut inputs = context.inputs.clone();
-        let mut response: CallResponse = CallResponse::forward(&context.incoming_alkanes.clone());
+        let mut response = CallResponse::default();
+
         match shift_or_err(&mut inputs)? {
-            /* initialize(u128, u128) */
+            // Initialize
             0 => {
-                let mut pointer = StoragePointer::from_keyword("/initialized");
-                if pointer.get().len() == 0 {
-                    let auth_token_units = shift_or_err(&mut inputs)?;
-                    response
-                        .alkanes
-                        .0
-                        .push(self.deploy_auth_token(auth_token_units)?);
-                    pointer.set(Arc::new(vec![0x01]));
-                    Ok(response)
-                } else {
-                    return Err(anyhow!("already initialized"));
-                }
+                self.initialize(&context)?;
+                Ok(response)
             },
+            // Mine
             1 => {
-                self.only_owner()?;
-                self.set_signer(&context, shift_or_err(&mut inputs)?.try_into()?)?;
-                response.data = self.signer();
+                let nonce = shift_or_err(&mut inputs)?;
+                self.verify_mining_solution(&context, nonce)?;
+                
+                // Get reward and mint tokens
+                let reward = self.get_mining_reward()?;
+                self.mint_tokens(&context, reward)?;
+                
+                // Start new epoch
+                self.start_new_mining_epoch()?;
+                
+                // Create reward transfer
+                response.alkanes = AlkaneTransferParcel {
+                    transfers: vec![AlkaneTransfer {
+                        id: context.myself.clone(),
+                        value: reward,
+                    }]
+                };
+                
                 Ok(response)
-            }
-            /* get_signer() -> String */
-            100001 => {
-              response.data = to_address_str(Script::from_bytes(self.signer_pointer().get().as_ref())).ok_or("").map_err(|_| anyhow!("invalid script"))?.as_bytes().to_vec();
-              Ok(response)
-            }
-            /* mint(u128) */
-            77 => {
-                response.alkanes.0.push(self.exchange(&context)?);
+            },
+            // Get current mining target
+            2 => {
+                let target = self.mining_target_pointer().get_value::<u128>()?;
+                response.data = target.to_le_bytes().to_vec();
                 Ok(response)
-            }
-            78 => {
-                if context.caller.clone() != (AlkaneId { tx: 0, block: 0 }) {
-                  return Err(anyhow!("must be called by EOA"));
-                }
-                if context.incoming_alkanes.0.len() != 1 {
-                  return Err(anyhow!("must only send synthetics as input alkanes"));
-                }
-                let burn_value = self.burn(&context, shift_or_err(&mut inputs)?.try_into()?)?;
-                let mut burn_response = CallResponse::default();
-                burn_response.data = burn_value.to_le_bytes().to_vec();
-                Ok(burn_response)
-            }
-            /* name() */
-            99 => {
-                response.data = self.name().into_bytes().to_vec();
+            },
+            // Get current challenge number
+            3 => {
+                let challenge = self.challenge_pointer().get_value::<[u8; 32]>()?;
+                response.data = challenge.to_vec();
                 Ok(response)
-            }
-            /* symbol() */
-            100 => {
-                response.data = self.symbol().into_bytes().to_vec();
-                Ok(response)
-            }
-            /* payments_at_height */
-            1001 => {
-                let mut payments = CallResponse::forward(&context.incoming_alkanes);
-                payments.data = StoragePointer::from_keyword("/payments/byheight/").select_value(self.height()).get_list().into_iter().fold(Vec::<u8>::new(), |r, v| {
-                  let mut result = Vec::<u8>::with_capacity(r.len() + v.len());
-                  result.extend(&r);
-                  result.extend(v.as_ref());
-                  result
-                });
-                Ok(payments)
-            }
-            _ => {
-                panic!("unrecognized opcode");
-            }
+            },
+            _ => Err(anyhow!("unrecognized opcode"))
         }
     }
-}
-
-#[no_mangle]
-pub extern "C" fn __execute() -> i32 {
-    let mut response = to_arraybuffer_layout(&SyntheticBitcoin::default().run());
-    to_passback_ptr(&mut response)
 }

@@ -1,266 +1,158 @@
+use alkanes::indexer::index_block;
 use alkanes::message::AlkaneMessageContext;
-use alkanes_support::id::AlkaneId;
 use anyhow::Result;
 use bitcoin::blockdata::transaction::OutPoint;
-use bitcoin::address::{NetworkChecked};
-use bitcoin::{Witness, Sequence,  Amount, ScriptBuf, Script, Address, TxIn, TxOut, Transaction};
-use protorune_support::protostone::Protostone;
-use protorune::protostone::Protostones;
-#[allow(unused_imports)]
-use hex;
+use bitcoin::{
+    Transaction, TxOut, Amount,
+    transaction::Version, 
+    absolute::LockTime,
+    Block, blockdata::block::Header,
+    block::Version as BlockVersion,
+    BlockHash,
+    TxMerkleNode,
+    pow::CompactTarget,
+    hashes::sha256d,
+    Address, Network,
+    Script,
+};
+use bitcoin::hashes::Hash as HashTrait;
+use std::str::FromStr;
+use protorune::message::MessageContext;
+use protorune::tables::RuneTable;
+use protorune::balance_sheet::load_sheet;
 use metashrew_support::index_pointer::KeyValuePointer;
-#[allow(unused_imports)]
-use metashrew_support::{utils::{format_key}};
-use protorune::{test_helpers::{get_address}, balance_sheet::load_sheet, message::MessageContext, tables::RuneTable};
-
-use protorune_support::utils::consensus_encode;
-
-use alkanes::indexer::index_block;
-use ordinals::{Runestone, Artifact};
-use alkanes::tests::helpers as alkane_helpers;
-use alkanes::precompiled::{alkanes_std_auth_token_build};
-use alkanes_support::{cellpack::Cellpack, constants::AUTH_TOKEN_FACTORY_ID};
-use crate::tests::std::fr_btc_build;
-#[allow(unused_imports)]
-use metashrew::{get_cache, index_pointer::IndexPointer, println, stdio::stdout};
-use alkane_helpers::{clear};
+use metashrew_support::utils::consensus_encode;
+use metashrew::stdout;
 use std::fmt::Write;
 use wasm_bindgen_test::wasm_bindgen_test;
 
-pub const TEST_MULTISIG: &'static str = "bcrt1pys2f8u8yx7nu08txn9kzrstrmlmpvfprdazz9se5qr5rgtuz8htsaz3chd";
-pub const ADDRESS1: &'static str = "bcrt1qzr9vhs60g6qlmk7x3dd7g3ja30wyts48sxuemv";
+pub const TEST_MINER: &'static str = "bcrt1qzr9vhs60g6qlmk7x3dd7g3ja30wyts48sxuemv";
 
-fn pay_to_musig(inputs: Vec<OutPoint>, amount: u64) -> Transaction {
-  let protostone: Protostone = Protostone {
-    burn: None,
-    edicts: vec![],
-    pointer: Some(1),
-    refund: Some(2),
-    from: None,
-    protocol_tag: AlkaneMessageContext::protocol_tag(),
-    message: (Cellpack {
-      target: AlkaneId {
-        block: 4,
-        tx: 0
-      },
-      inputs: vec![77]
-    }).encipher(),
-  };
-  let runestone: ScriptBuf = (Runestone {
-    etching: None,
-    pointer: Some(0), // points to the OP_RETURN, so therefore targets the protoburn
-    edicts: Vec::new(),
-    mint: None,
-    protocol: vec![protostone].encipher().ok(),
-  }).encipher();
-  let op_return = TxOut {
-    value: Amount::from_sat(0),
-    script_pubkey: runestone,
-  };
-  let address: Address<NetworkChecked> = get_address(ADDRESS1);
-  let _script_pubkey = address.script_pubkey();
-  Transaction {
-    version: bitcoin::blockdata::transaction::Version::ONE,
-    lock_time: bitcoin::absolute::LockTime::ZERO,
-    input: inputs.into_iter().map(|v| TxIn {
-      previous_output: v,
-      witness: Witness::new(),
-      script_sig: ScriptBuf::new(),
-      sequence: Sequence::MAX
-    }).collect::<Vec<TxIn>>(),
-    output: vec![
-      TxOut {
-        value: Amount::from_sat(amount),
-        script_pubkey: get_address(TEST_MULTISIG).script_pubkey()
-      },
-      TxOut {
-        value: Amount::from_sat(546),
-        script_pubkey: _script_pubkey.clone()
-      },
-      op_return
-    ]
-  }
-}
-
-fn set_signer(inputs: Vec<OutPoint>) -> Transaction {
-  let protostone: Protostone = Protostone {
-    burn: None,
-    edicts: vec![],
-    pointer: Some(1),
-    refund: Some(2),
-    from: None,
-    protocol_tag: AlkaneMessageContext::protocol_tag(),
-    message: (Cellpack {
-      target: AlkaneId {
-        block: 4,
-        tx: 0
-      },
-      inputs: vec![1, 0]
-    }).encipher(),
-  };
-  let runestone: ScriptBuf = (Runestone {
-    etching: None,
-    pointer: Some(0), // points to the OP_RETURN, so therefore targets the protoburn
-    edicts: Vec::new(),
-    mint: None,
-    protocol: vec![protostone].encipher().ok(),
-  }).encipher();
-  let op_return = TxOut {
-    value: Amount::from_sat(0),
-    script_pubkey: runestone,
-  };
-  let address: Address<NetworkChecked> = get_address(ADDRESS1);
-  let _script_pubkey = address.script_pubkey();
-  Transaction {
-    version: bitcoin::blockdata::transaction::Version::ONE,
-    lock_time: bitcoin::absolute::LockTime::ZERO,
-    input: inputs.into_iter().map(|v| TxIn {
-      previous_output: v,
-      witness: Witness::new(),
-      script_sig: ScriptBuf::new(),
-      sequence: Sequence::MAX
-    }).collect::<Vec<TxIn>>(),
-    output: vec![
-      TxOut {
-        value: Amount::from_sat(546),
-        script_pubkey: get_address(TEST_MULTISIG).script_pubkey()
-      },
-      TxOut {
-        value: Amount::from_sat(546),
-        script_pubkey: get_address(ADDRESS1).script_pubkey()
-      },
-      op_return
-    ]
-  }
-}
-
-fn burn(inputs: Vec<OutPoint>) -> Transaction {
-  let protostone: Protostone = Protostone {
-    burn: None,
-    edicts: vec![],
-    pointer: Some(0),
-    refund: Some(2),
-    from: None,
-    protocol_tag: AlkaneMessageContext::protocol_tag(),
-    message: (Cellpack {
-      target: AlkaneId {
-        block: 4,
-        tx: 0
-      },
-      inputs: vec![78, 1]
-    }).encipher(),
-  };
-  let runestone: ScriptBuf = (Runestone {
-    etching: None,
-    pointer: Some(0), // points to the OP_RETURN, so therefore targets the protoburn
-    edicts: Vec::new(),
-    mint: None,
-    protocol: vec![protostone].encipher().ok(),
-  }).encipher();
-  let op_return = TxOut {
-    value: Amount::from_sat(0),
-    script_pubkey: runestone,
-  };
-  let address: Address<NetworkChecked> = get_address(ADDRESS1);
-  let _script_pubkey = address.script_pubkey();
-  Transaction {
-    version: bitcoin::blockdata::transaction::Version::ONE,
-    lock_time: bitcoin::absolute::LockTime::ZERO,
-    input: inputs.into_iter().map(|v| TxIn {
-      previous_output: v,
-      witness: Witness::new(),
-      script_sig: ScriptBuf::new(),
-      sequence: Sequence::MAX
-    }).collect::<Vec<TxIn>>(),
-    output: vec![
-      TxOut {
-        value: Amount::from_sat(546),
-        script_pubkey: get_address(ADDRESS1).script_pubkey()
-      },
-      TxOut {
-        value: Amount::from_sat(546),
-        script_pubkey: get_address(TEST_MULTISIG).script_pubkey()
-      },
-      op_return
-    ]
-  }
+// Function to create mining reward script
+fn create_mining_reward_script(block_height: u32) -> Script {
+    let mut script = Script::builder();
+    script = script
+        .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+        .push_slice(&[0xF2]) // Protocol identifier
+        .push_slice(&block_height.to_le_bytes()); // Block height as LE bytes
+    
+    script.into_script()
 }
 
 #[wasm_bindgen_test]
-fn test_synthetic_init() -> Result<()> {
-    clear();
-    let mut block_height = 850_000;
-    let cellpacks: Vec<Cellpack> = [
-        //auth token factory init
-        Cellpack {
-            target: AlkaneId { block: 3, tx: AUTH_TOKEN_FACTORY_ID },
-            inputs: vec![100]
+fn test_mining_reward() -> Result<()> {
+    let mut block_height = 0;
+    let mut output = String::new();
+    
+    // Create miner address
+    let miner_address = Address::from_str(TEST_MINER)?.require_network(Network::Regtest)?;
+    let miner_script = miner_address.script_pubkey();
+    
+    // Create initial block with coinbase
+    let mut test_block = Block {
+        header: Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: BlockHash::from_raw_hash(sha256d::Hash::all_zeros()),
+            merkle_root: TxMerkleNode::from_raw_hash(sha256d::Hash::all_zeros()),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            nonce: 0,
         },
-        Cellpack {
-            target: AlkaneId { block: 3, tx: 0 },
-            inputs: vec![0, 1],
-        }
-    ]
-    .into();
-    let mut test_block = alkane_helpers::init_with_multiple_cellpacks_with_tx(
-        [alkanes_std_auth_token_build::get_bytes(), fr_btc_build::get_bytes()].into(),
-        cellpacks,
-    );
-    let len = test_block.txdata.len();
-    let outpoint = OutPoint {
-        txid: test_block.txdata[len - 1].compute_txid(),
-        vout: 0
+        txdata: vec![
+            // Coinbase transaction
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],  // Empty for coinbase
+                output: vec![
+                    TxOut {
+                        value: Amount::from_sat(50 * 100_000_000),  // 50 BTC reward
+                        script_pubkey: miner_script.clone(),
+                    },
+                    // Add an OP_RETURN output for the mining reward protocol
+                    TxOut {
+                        value: Amount::from_sat(0),
+                        script_pubkey: create_mining_reward_script(block_height),
+                    }
+                ],
+            }
+        ],
     };
+
+    // Update merkle root
+    test_block.header.merkle_root = test_block.compute_merkle_root().unwrap();
+    
+    // Index the first block
     index_block(&test_block, block_height)?;
+
+    // Get outpoint from first transaction
+    let outpoint = OutPoint {
+        txid: test_block.txdata[0].compute_txid(),
+        vout: 0,
+    };
+
+    // Verify initialization
     let ptr = RuneTable::for_protocol(AlkaneMessageContext::protocol_tag())
         .OUTPOINT_TO_RUNES
         .select(&consensus_encode(&outpoint)?);
-    /*
-    get_cache().iter().for_each(|(k, v)| {
-      if v.as_ref().len() > 256 {
-        ()
-      } else {
-        println!("{}: {}", format_key(k.as_ref()), hex::encode(v.as_ref()));
-        ()
-      }
-    });
-    */
+    
     let sheet = load_sheet(&ptr);
-    test_block = alkane_helpers::init_with_multiple_cellpacks_with_tx(vec![], vec![]);
-    test_block.txdata.push(set_signer(vec![outpoint.clone()]));
-    test_block.txdata.push(pay_to_musig(vec![], 500_000_000));
-    block_height = block_height + 1;
-    /*
-    test_block.txdata.push(pay_to_musig(vec![], 500_000_000));
-    */
-    let len2 = test_block.txdata.len();
-    let outpoint2 = OutPoint {
-        txid: test_block.txdata[len2 - 1].compute_txid(),
-        vout: 1
+    write!(output, "Initial state: {:?}\n", sheet)?;
+    stdout().write_fmt(format_args!("{}", output))?;
+
+    // Create second block with mining reward
+    block_height += 1;
+    test_block = Block {
+        header: Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: test_block.block_hash(),
+            merkle_root: TxMerkleNode::from_raw_hash(sha256d::Hash::all_zeros()),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            nonce: 0,
+        },
+        txdata: vec![
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![
+                    TxOut {
+                        value: Amount::from_sat(50 * 100_000_000),
+                        script_pubkey: miner_script.clone(),
+                    },
+                    // Add mining reward protocol output
+                    TxOut {
+                        value: Amount::from_sat(0),
+                        script_pubkey: create_mining_reward_script(block_height),
+                    }
+                ],
+            }
+        ],
     };
+
+    // Update merkle root
+    test_block.header.merkle_root = test_block.compute_merkle_root().unwrap();
+    
+    // Index the second block
     index_block(&test_block, block_height)?;
-    let ptr = RuneTable::for_protocol(AlkaneMessageContext::protocol_tag())
+
+    // Verify mining result
+    let mining_result = RuneTable::for_protocol(AlkaneMessageContext::protocol_tag())
         .OUTPOINT_TO_RUNES
-        .select(&consensus_encode(&outpoint2)?);
-    /*
-    get_cache().iter().for_each(|(k, v)| {
-      if v.as_ref().len() > 256 {
-        ()
-      } else {
-        println!("{}: {}", format_key(k.as_ref()), hex::encode(v.as_ref()));
-        ()
-      }
-    });
-    */
-    let sheet2 = load_sheet(&ptr);
-    println!("balances at end {:?}", sheet2);
-    test_block = alkane_helpers::init_with_multiple_cellpacks_with_tx(vec![], vec![]);
-    test_block.txdata.push(burn(vec![outpoint2]));
-    block_height = block_height + 1;
-    index_block(&test_block, block_height)?;
-    println!("{}", hex::encode(IndexPointer::from_keyword("/alkanes/").select(&(AlkaneId {
-      block: 4,
-      tx: 0
-    }).into()).keyword("/storage/").keyword("/payments/byheight/").select_value::<u64>(block_height.into()).get().as_ref().clone()));
+        .select(&consensus_encode(&OutPoint {
+            txid: test_block.txdata[0].compute_txid(),
+            vout: 0
+        })?);
+
+    let final_sheet = load_sheet(&mining_result);
+    write!(output, "Final state after mining: {:?}\n", final_sheet)?;
+    stdout().write_fmt(format_args!("{}", output))?;
+
+    // Verify mining reward was issued
+    assert!(!final_sheet.balances.is_empty() && 
+            final_sheet.balances.values().any(|&v| v > 0), 
+            "No mining reward issued");
+
     Ok(())
 }
